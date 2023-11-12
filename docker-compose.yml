@@ -1,0 +1,14 @@
+version: '3'
+
+services:
+  chrome-extension:
+    build:
+      context: ./chrome-extension
+    depends_on:
+      - server
+
+  server:
+    build:
+      context: ./server
+    ports:
+      - "3000:3000"
