@@ -50,7 +50,10 @@ export function HoverCard({ data, onDismiss }: HoverCardProps) {
   const handleAudio = () => {
     try {
       const utterance = new SpeechSynthesisUtterance(translation);
-      utterance.lang = 'fr-FR'; // TODO: use active language
+      // Use the ttsLang from the language config stored in the span's data attribute
+      const span = document.querySelector('[data-fluentify-lang]') as HTMLElement | null;
+      const ttsLang = span?.dataset?.fluentifyLang ?? 'fr-FR';
+      utterance.lang = ttsLang;
       utterance.rate = 0.9;
       speechSynthesis.cancel();
       speechSynthesis.speak(utterance);
