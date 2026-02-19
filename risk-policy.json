@@ -1,0 +1,107 @@
+{
+  "_comment": "Code Factory Risk Policy for fluentify-v2 — a Chrome browser extension.",
+  "_comment_context": "This is a browser extension. Background scripts and content scripts run with full Chrome permissions in the user's browser. Changes to these files are CRITICAL HIGH RISK because a bug can compromise user security or crash the extension for all users. The manifest.ts controls what permissions the extension requests — changes there can silently expand attack surface.",
+  "_comment_usage": "Parsed by scripts/risk-policy-check.js at PR time. Bump the version field on every change so downstream audits can detect contract changes.",
+  "version": "1.0.0",
+
+  "riskTierRules": {
+    "_comment": "Files matching ANY pattern in 'high.patterns' are classified HIGH risk. A PR is HIGH tier if even one changed file matches. Everything else is LOW. Uses minimatch glob syntax.",
+
+    "high": {
+      "patterns": [
+        "src/background/**",
+        "src/content/**",
+        "src/manifest.ts",
+        "src/lib/**",
+        "src/hooks/**",
+        "src/options/**",
+        "*.config.ts",
+        "*.config.js",
+        "vite.config.*",
+        "tsconfig.json",
+        "package.json",
+        "package-lock.json",
+        ".github/workflows/**",
+        "risk-policy.json"
+      ],
+      "description": "Background service worker, content scripts, extension manifest, core libraries, shared hooks, options page, build config, CI/CD. Changes here require full review pipeline: AI code review + CI. Background/content scripts run with full Chrome extension permissions — a bug here affects every user session."
+    },
+
+    "low": {
+      "_comment": "Catch-all. Covers popup UI (src/popup/**), types (src/types/**), static data (src/data/**), and styles. Standard automated gate + CI is sufficient.",
+      "patterns": [
+        "**"
+      ],
+      "description": "Popup UI components, type definitions, static data, styles, docs, assets. Standard automated gate + CI is sufficient."
+    }
+  },
+
+  "mergePolicy": {
+    "_comment": "Required status check names per risk tier. These strings must match your GitHub branch protection rule check names EXACTLY (case-sensitive). The CI check name 'Build & Type Check' matches the existing ci.yml job name exactly.",
+
+    "high": {
+      "requiredChecks": [
+        "risk-policy-gate",
+        "code-review-agent",
+        "Build & Type Check"
+      ],
+      "_comment": "Three checks required for high-risk PRs. code-review-agent = Greptile or CodeRabbit approved. 'Build & Type Check' = the existing ci.yml job (typecheck + lint + build + test). All three must pass before merge."
+    },
+
+    "low": {
+      "requiredChecks": [
+        "risk-policy-gate",
+        "Build & Type Check"
+      ],
+      "_comment": "Low-risk PRs need the policy gate and CI. No AI review required for popup UI, types, data, or style changes."
+    }
+  },
+
+  "docsDriftRules": {
+    "_comment": "Disabled — fluentify-v2 does not have a docs/ folder. Re-enable this when a docs/ directory is established for the project.",
+    "enabled": false,
+    "rules": [
+      {
+        "controlPlanePattern": ".github/workflows/**",
+        "requiredDocPattern": "docs/ci/**",
+        "_comment": "Disabled — no docs/ folder in this repo."
+      },
+      {
+        "controlPlanePattern": "risk-policy.json",
+        "requiredDocPattern": "docs/risk-policy/**",
+        "_comment": "Disabled — no docs/ folder in this repo. See CODE_FACTORY.md for policy documentation."
+      }
+    ]
+  },
+
+  "browserEvidence": {
+    "_comment": "Browser evidence configuration. NOTE: For fluentify-v2, this is a Chrome EXTENSION — not a web app. Traditional browser evidence (staging URL + screenshot manifest) is N/A. Extension evidence is captured differently: loading the unpacked extension in Chrome and running extension-specific tests. The browser-evidence check is NOT included in requiredChecks for this reason. If browser-extension-specific evidence capture is implemented in the future, update mergePolicy.high.requiredChecks accordingly.",
+    "_comment_na": "browser-evidence is N/A for Chrome extensions. Evidence must be captured by loading the unpacked extension build in Chrome DevTools, not by navigating to a staging URL.",
+    "maxAgeHours": 24,
+    "requiredFiles": [
+      "evidence/manifest.json",
+      "evidence/screenshot.png"
+    ],
+    "manifestSchema": {
+      "required": [
+        "entrypoint",
+        "capturedAt",
+        "headSha",
+        "flows"
+      ]
+    }
+  },
+
+  "harnessGap": {
+    "_comment": "When a production regression is detected and no test case covers it, create a GitHub Issue labeled 'harness-gap' and merge a new Vitest test case within 3 days.",
+    "enabled": true,
+    "slaDays": 3,
+    "label": "harness-gap"
+  },
+
+  "remediation": {
+    "_comment": "Safety guardrails for the auto-remediation loop. After 3 failed auto-remediation attempts on a single commit SHA, the workflow stops and requires human intervention. Counter resets when a new commit is pushed (new SHA). Agent is set to codex — configure OPENAI_API_KEY secret in repository settings.",
+    "maxAttemptsPerPR": 3,
+    "agent": "codex"
+  }
+}

@@ -1,0 +1,251 @@
+# risk-policy-gate.yml
+#
+# THE FIRST GATE — runs on every PR to fluentify-v2, before any merge is allowed.
+#
+# This is a Chrome browser extension repo. Changes to background scripts,
+# content scripts, and manifest.ts are CRITICAL HIGH RISK because they run
+# with full browser permissions in the user's Chrome instance. This gate
+# enforces higher review standards for those paths.
+#
+# What it does:
+#   1. Gets the list of changed files (git diff against base branch)
+#   2. Runs scripts/risk-policy-check.js to classify files into high/low tier
+#   3. Posts a comment on the PR with the tier result and required checks
+#   4. Fails the workflow (blocking merge) if a policy violation is found
+#
+# Output check name: risk-policy-gate
+# This string must be added to branch protection required status checks.
+
+name: Risk Policy Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Cancel any in-progress run for the same PR when a new commit is pushed.
+# WHY: A superseded commit's gate result is irrelevant — only HEAD matters.
+concurrency:
+  group: risk-policy-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write  # Required to comment on PR
+  statuses: write       # Required to set commit status
+
+jobs:
+  gate:
+    name: risk-policy-gate
+    runs-on: ubuntu-latest
+
+    # Expose tier classification so dependent workflows can read it.
+    outputs:
+      risk_tier:        ${{ steps.classify.outputs.risk_tier }}
+      required_checks:  ${{ steps.classify.outputs.required_checks }}
+      policy_violated:  ${{ steps.classify.outputs.policy_violated }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Checkout — full history needed for accurate git diff
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Step 2: Set up Node.js — used to run risk-policy-check.js
+      # -----------------------------------------------------------------------
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # -----------------------------------------------------------------------
+      # Step 3: Install minimatch (isolated to avoid conflicting with repo deps)
+      # -----------------------------------------------------------------------
+      - name: Install risk-policy-check dependencies
+        run: |
+          mkdir -p /tmp/rpcheck
+          cd /tmp/rpcheck
+          npm init -y --quiet
+          npm install --quiet minimatch@8
+          echo "minimatch installed to /tmp/rpcheck/node_modules"
+
+      # -----------------------------------------------------------------------
+      # Step 4: Get changed files via git diff
+      # -----------------------------------------------------------------------
+      - name: Get changed files
+        id: changed-files
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+
+          git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+            > /tmp/changed-files.txt
+
+          echo "Changed files:"
+          cat /tmp/changed-files.txt
+
+          FILES=$(paste -sd ',' /tmp/changed-files.txt)
+          echo "files=${FILES}" >> "$GITHUB_OUTPUT"
+          echo "count=$(wc -l < /tmp/changed-files.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Step 5: Classify risk tier via risk-policy-check.js
+      # -----------------------------------------------------------------------
+      - name: Classify risk tier
+        id: classify
+        run: |
+          NODE_PATH=/tmp/rpcheck/node_modules \
+          node scripts/risk-policy-check.js \
+            --files "${{ steps.changed-files.outputs.files }}" \
+            --policy risk-policy.json \
+            --sha    "${{ github.event.pull_request.head.sha }}" \
+            --output /tmp/risk-result.json
+
+          TIER=$(jq -r '.tier' /tmp/risk-result.json)
+          CHECKS=$(jq -c '.requiredChecks' /tmp/risk-result.json)
+          VIOLATED=$(jq -r '.policyViolated' /tmp/risk-result.json)
+
+          echo "risk_tier=${TIER}"           >> "$GITHUB_OUTPUT"
+          echo "required_checks=${CHECKS}"   >> "$GITHUB_OUTPUT"
+          echo "policy_violated=${VIOLATED}" >> "$GITHUB_OUTPUT"
+
+          echo "Tier: ${TIER} | Policy violated: ${VIOLATED}"
+
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Step 6: Post tier classification comment on the PR
+      # -----------------------------------------------------------------------
+      - name: Post tier classification comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let result;
+            try {
+              result = JSON.parse(fs.readFileSync('/tmp/risk-result.json', 'utf8'));
+            } catch (e) {
+              core.warning(`Could not read risk-result.json: ${e.message}. Using fallback.`);
+              result = {
+                tier: 'unknown',
+                headSha: '${{ github.event.pull_request.head.sha }}',
+                filesAnalyzed: 0,
+                highRiskFiles: [],
+                requiredChecks: [],
+                policyViolated: true,
+                violationReason: 'risk-policy-check.js failed to produce output. Check the workflow logs.',
+                docsDriftViolations: [],
+                policyVersion: 'unknown',
+              };
+            }
+
+            const tierEmoji   = result.tier === 'high' ? '🔴' : (result.tier === 'low' ? '🟢' : '⚪');
+            const tierLabel   = result.tier.toUpperCase();
+            const shortSha    = result.headSha.substring(0, 12);
+            const checksLines = result.requiredChecks.length > 0
+              ? result.requiredChecks.map(c => `  - \`${c}\``).join('\n')
+              : '  - *(none — empty changeset)*';
+
+            const highRiskSection = result.highRiskFiles.length > 0
+              ? [
+                  '',
+                  '### 🔍 High-Risk Files Triggering Elevated Tier',
+                  result.highRiskFiles
+                    .map(f => `  - \`${f.file}\`  ← matched pattern: \`${f.matchedPattern}\``)
+                    .join('\n'),
+                ].join('\n')
+              : '';
+
+            const driftSection = result.docsDriftViolations.length > 0
+              ? [
+                  '',
+                  '### ⚠️ Docs Drift Violations',
+                  result.docsDriftViolations
+                    .map(v => `  - **\`${v.controlPlane}\`** changed but **\`${v.requiredDoc}\`** was not updated`)
+                    .join('\n'),
+                  '',
+                  '*Fix: update the corresponding documentation in this PR, or set `docsDriftRules.enabled: false` in `risk-policy.json` to disable this check.*',
+                ].join('\n')
+              : '';
+
+            const statusSection = result.policyViolated
+              ? [
+                  '',
+                  '### ❌ Policy Violation — This PR Cannot Merge',
+                  '',
+                  '```',
+                  result.violationReason || 'Policy violated. See above.',
+                  '```',
+                ].join('\n')
+              : [
+                  '',
+                  '### ✅ Policy Requirements Met',
+                  '',
+                  `All required checks are configured for the **${tierLabel}** tier.`,
+                  'Merge will be possible once all required checks pass.',
+                ].join('\n');
+
+            const body = [
+              '<!-- risk-policy-gate-comment -->',
+              `## ${tierEmoji} Risk Policy Gate — ${tierLabel} TIER`,
+              '',
+              `| Field | Value |`,
+              `|---|---|`,
+              `| HEAD SHA | \`${shortSha}...\` |`,
+              `| Policy version | \`${result.policyVersion}\` |`,
+              `| Files analyzed | ${result.filesAnalyzed} |`,
+              `| High-risk files | ${result.highRiskFiles.length} |`,
+              '',
+              '### Required Status Checks for This PR',
+              checksLines,
+              highRiskSection,
+              driftSection,
+              statusSection,
+              '',
+              `<sub>Generated by [risk-policy-gate](.github/workflows/risk-policy-gate.yml) · SHA \`${shortSha}\`</sub>`,
+            ].filter(s => s !== null && s !== undefined).join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              per_page:     100,
+            });
+
+            const existing = comments.find(c =>
+              c.body && c.body.includes('<!-- risk-policy-gate-comment -->')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              console.log(`Updated existing gate comment (id: ${existing.id})`);
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              console.log('Created new gate comment');
+            }
+
+      # -----------------------------------------------------------------------
+      # Step 7: Hard fail if policy violated
+      # -----------------------------------------------------------------------
+      - name: Fail workflow if policy violated
+        if: steps.classify.outputs.policy_violated == 'true'
+        run: |
+          echo "::error title=Risk Policy Violation::Policy violation detected."
+          echo "::error::See the PR comment from the risk-policy-gate for details."
+          echo ""
+          echo "The PR cannot merge until the policy violation is resolved."
+          exit 1

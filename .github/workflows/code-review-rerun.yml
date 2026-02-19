@@ -1,0 +1,153 @@
+# code-review-rerun.yml
+#
+# THE CANONICAL RERUN REQUESTER — one writer, no race conditions.
+#
+# For the fluentify-v2 Chrome extension, this triggers a fresh AI code review
+# every time new commits are pushed to a PR. SHA deduplication ensures only
+# one review request is posted per commit, even if multiple workflows fire.
+#
+# How it fits the loop:
+#   coding agent pushes commit → this workflow fires → @bot review comment →
+#   bot reviews → remediation.yml patches findings → push → this fires again
+#
+# Configure CODE_REVIEW_SERVICE in repository Variables:
+#   Settings → Secrets and variables → Variables → CODE_REVIEW_SERVICE
+#   Valid values: 'greptile' | 'coderabbitai'
+
+name: Code Review Rerun
+
+on:
+  pull_request:
+    types: [synchronize]
+
+concurrency:
+  group: code-review-rerun-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+env:
+  CODE_REVIEW_SERVICE: ${{ vars.CODE_REVIEW_SERVICE || 'coderabbitai' }}
+
+jobs:
+  request-review:
+    name: Request Code Review (SHA-deduplicated)
+    runs-on: ubuntu-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: SHA deduplication check
+      # -----------------------------------------------------------------------
+      - name: Check for duplicate review request (SHA deduplication)
+        id: dedupe
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const headSha = context.payload.pull_request.head.sha;
+            const marker  = `<!-- code-review-requested sha:${headSha} -->`;
+
+            console.log(`Current HEAD SHA: ${headSha}`);
+
+            let page = 1;
+            let alreadyRequested = false;
+
+            while (true) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                per_page:     100,
+                page,
+              });
+
+              if (comments.length === 0) break;
+
+              if (comments.some(c => c.body && c.body.includes(marker))) {
+                alreadyRequested = true;
+                break;
+              }
+
+              if (comments.length < 100) break;
+              page++;
+            }
+
+            if (alreadyRequested) {
+              console.log(`Review already requested for SHA ${headSha.substring(0, 12)}. Skipping.`);
+              core.setOutput('should_request', 'false');
+            } else {
+              console.log(`No review request found for SHA ${headSha.substring(0, 12)}. Will request.`);
+              core.setOutput('should_request', 'true');
+              core.setOutput('head_sha', headSha);
+              core.setOutput('marker', marker);
+            }
+
+      # -----------------------------------------------------------------------
+      # Step 2: Post review request comment
+      # -----------------------------------------------------------------------
+      - name: Post review request to code review agent
+        if: steps.dedupe.outputs.should_request == 'true'
+        uses: actions/github-script@v7
+        env:
+          CODE_REVIEW_SERVICE: ${{ env.CODE_REVIEW_SERVICE }}
+        with:
+          script: |
+            const headSha = '${{ steps.dedupe.outputs.head_sha }}';
+            const marker  = '${{ steps.dedupe.outputs.marker }}';
+            const service = process.env.CODE_REVIEW_SERVICE;
+
+            const botMentions = {
+              'greptile':     '@greptile',
+              'coderabbitai': '@coderabbitai',
+            };
+
+            const botMention = botMentions[service];
+            if (!botMention) {
+              core.setFailed(
+                `Unknown CODE_REVIEW_SERVICE: "${service}". ` +
+                `Set the CODE_REVIEW_SERVICE repository variable to "greptile" or "coderabbitai".`
+              );
+              return;
+            }
+
+            const shortSha = headSha.substring(0, 12);
+            const prTitle  = context.payload.pull_request.title;
+            const prBranch = context.payload.pull_request.head.ref;
+
+            const body = [
+              marker,
+              '',
+              `${botMention} review`,
+              '',
+              `**Auto-triggered review request** for commit \`${shortSha}...\` on branch \`${prBranch}\`.`,
+              '',
+              '**PR context:** ' + prTitle,
+              '',
+              '**Repository:** fluentify-v2 (Chrome browser extension)',
+              '',
+              'Please review this commit and flag any:',
+              '- Security vulnerabilities — especially anything that could be exploited via extension permissions',
+              '- Logic errors in background service worker or content scripts',
+              '- Manifest permission changes that expand the extension\'s access scope',
+              '- Missing or incomplete error handling',
+              '- TypeScript type errors or unsafe `any` usage',
+              '- Test coverage gaps for changed logic',
+              '',
+              'If the code looks good, please respond with "No issues found" or "LGTM" so the',
+              'auto-resolve workflow can clean up resolved threads.',
+              '',
+              '_This review was automatically requested by the [code-review-rerun](.github/workflows/code-review-rerun.yml) workflow._',
+              '_Only one review is requested per commit SHA to prevent duplicates._',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+            console.log(`✓ Review requested from ${botMention} for SHA ${shortSha}`);
+            console.log(`  Service: ${service}`);
+            console.log(`  PR #${context.issue.number}`);

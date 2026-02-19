@@ -1,0 +1,263 @@
+# auto-resolve-threads.yml
+#
+# STALE BOT-THREAD CLEANUP — keeps PR review threads clean and unblocks merge.
+#
+# After the remediation loop fixes code review findings, the review bot posts
+# a clean review ("LGTM" / "No issues found"). But the original review threads
+# remain "unresolved" in GitHub's UI — blocking merge when branch protection
+# requires all conversations to be resolved.
+#
+# This workflow:
+#   1. Detects when the review bot posts a clean review signal
+#   2. Queries all open review threads via GraphQL
+#   3. Resolves threads where EVERY comment is from the bot
+#   4. NEVER resolves threads with any human comment (safety invariant)
+#   5. Re-triggers risk-policy-gate to refresh required status checks
+#
+# Configure CODE_REVIEW_BOT in repository Variables:
+#   Settings → Secrets and variables → Variables → CODE_REVIEW_BOT
+#   Must exactly match the GitHub login of the bot (e.g., 'coderabbitai[bot]')
+
+name: Auto-Resolve Bot Review Threads
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+  contents: read
+  actions: write
+
+env:
+  CODE_REVIEW_BOT: ${{ vars.CODE_REVIEW_BOT || 'coderabbitai[bot]' }}
+
+jobs:
+  auto-resolve:
+    name: Auto-Resolve Stale Bot-Only Review Threads
+    runs-on: ubuntu-latest
+
+    if: github.event.issue.pull_request != null
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Detect clean review signal from bot
+      # -----------------------------------------------------------------------
+      - name: Detect clean review signal from bot
+        id: clean-check
+        uses: actions/github-script@v7
+        env:
+          CODE_REVIEW_BOT: ${{ env.CODE_REVIEW_BOT }}
+        with:
+          script: |
+            const comment  = context.payload.comment;
+            const botLogin = process.env.CODE_REVIEW_BOT;
+            const prNumber = context.issue.number;
+
+            if (comment.user.login !== botLogin) {
+              console.log(`Comment from @${comment.user.login} (not @${botLogin}). Skipping.`);
+              core.setOutput('is_clean', 'false');
+              return;
+            }
+
+            const body = comment.body || '';
+
+            const cleanSignals = [
+              'no issues found',
+              'lgtm',
+              'looks good to me',
+              'no findings',
+              'no actionable comments',
+              'all previous issues have been resolved',
+              'all issues have been resolved',
+              'no comments',
+              'approved',
+            ];
+
+            const isClean = cleanSignals.some(signal =>
+              body.toLowerCase().includes(signal)
+            );
+
+            if (!isClean) {
+              console.log('Bot comment does not signal a clean review. Skipping thread resolution.');
+              core.setOutput('is_clean', 'false');
+              return;
+            }
+
+            console.log(`Clean review signal detected from @${botLogin} on PR #${prNumber}.`);
+            core.setOutput('is_clean',  'true');
+            core.setOutput('pr_number', prNumber.toString());
+
+      # -----------------------------------------------------------------------
+      # Step 2: Query all review threads via GraphQL
+      # -----------------------------------------------------------------------
+      - name: Query review threads
+        id: query-threads
+        if: steps.clean-check.outputs.is_clean == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = parseInt('${{ steps.clean-check.outputs.pr_number }}', 10);
+
+            const query = `
+              query GetReviewThreads($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100) {
+                      nodes {
+                        id
+                        isResolved
+                        isOutdated
+                        comments(first: 50) {
+                          nodes {
+                            author {
+                              login
+                            }
+                            body
+                            createdAt
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const result = await github.graphql(query, {
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              pr:    prNumber,
+            });
+
+            const threads = result.repository.pullRequest.reviewThreads.nodes;
+            console.log(`Found ${threads.length} review thread(s) on PR #${prNumber}.`);
+
+            core.setOutput('threads_json', JSON.stringify(threads));
+            core.setOutput('thread_count', threads.length.toString());
+
+      # -----------------------------------------------------------------------
+      # Step 3: Resolve bot-only threads
+      #
+      # SAFETY INVARIANT: Never auto-resolve a thread that has a human comment.
+      # A human tracking that thread means it needs human resolution.
+      # -----------------------------------------------------------------------
+      - name: Resolve bot-only threads
+        id: resolve-threads
+        if: steps.clean-check.outputs.is_clean == 'true'
+        uses: actions/github-script@v7
+        env:
+          CODE_REVIEW_BOT: ${{ env.CODE_REVIEW_BOT }}
+        with:
+          script: |
+            const botLogin = process.env.CODE_REVIEW_BOT;
+            const threads  = JSON.parse('${{ steps.query-threads.outputs.threads_json }}');
+
+            let resolvedCount  = 0;
+            let skippedHuman   = 0;
+            let skippedAlready = 0;
+
+            const resolveMutation = `
+              mutation ResolveThread($threadId: ID!) {
+                resolveReviewThread(input: { threadId: $threadId }) {
+                  thread {
+                    id
+                    isResolved
+                  }
+                }
+              }
+            `;
+
+            for (const thread of threads) {
+              if (thread.isResolved) {
+                skippedAlready++;
+                continue;
+              }
+
+              const comments = thread.comments.nodes;
+
+              const hasHumanComment = comments.some(c => {
+                const author = c.author?.login || '';
+                const isBot  = author === botLogin ||
+                               author.endsWith('[bot]') ||
+                               author === 'github-actions[bot]';
+                return !isBot;
+              });
+
+              if (hasHumanComment) {
+                console.log(
+                  `⏭  Thread ${thread.id}: has human comment(s). ` +
+                  `Skipping (safety: never auto-resolve human threads).`
+                );
+                skippedHuman++;
+                continue;
+              }
+
+              try {
+                await github.graphql(resolveMutation, { threadId: thread.id });
+                console.log(`✓  Thread ${thread.id}: resolved (bot-only thread, clean review)`);
+                resolvedCount++;
+              } catch (e) {
+                console.log(`⚠  Thread ${thread.id}: failed to resolve — ${e.message}`);
+              }
+            }
+
+            console.log('');
+            console.log('── Thread Resolution Summary ──────────────────');
+            console.log(`  Resolved:         ${resolvedCount}`);
+            console.log(`  Skipped (human):  ${skippedHuman}  ← NEVER auto-resolved`);
+            console.log(`  Already resolved: ${skippedAlready}`);
+            console.log('───────────────────────────────────────────────');
+
+            core.setOutput('resolved_count', resolvedCount.toString());
+            core.setOutput('skipped_human',  skippedHuman.toString());
+
+      # -----------------------------------------------------------------------
+      # Step 4: Re-trigger risk-policy-gate to update status checks
+      # -----------------------------------------------------------------------
+      - name: Re-trigger risk-policy-gate to update status checks
+        if: |
+          steps.clean-check.outputs.is_clean == 'true' &&
+          steps.resolve-threads.outputs.resolved_count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber      = parseInt('${{ steps.clean-check.outputs.pr_number }}', 10);
+            const resolvedCount = '${{ steps.resolve-threads.outputs.resolved_count }}';
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            const branch = pr.head.ref;
+
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              workflow_id: 'risk-policy-gate.yml',
+              branch,
+              per_page:    5,
+            });
+
+            if (runs.workflow_runs.length === 0) {
+              console.log('No risk-policy-gate runs found for this branch. Skipping re-trigger.');
+              return;
+            }
+
+            const latestRun = runs.workflow_runs[0];
+
+            try {
+              await github.rest.actions.reRunWorkflow({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                run_id: latestRun.id,
+              });
+              console.log(
+                `Re-triggered risk-policy-gate run ${latestRun.id} ` +
+                `(resolved ${resolvedCount} thread(s) → status check will update)`
+              );
+            } catch (e) {
+              console.log(`Could not re-trigger run: ${e.message}. Status check will update on next PR event.`);
+            }

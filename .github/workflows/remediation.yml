@@ -1,0 +1,445 @@
+# remediation.yml
+#
+# THE AUTO-REMEDIATION LOOP — closes the write → review → fix cycle.
+#
+# For fluentify-v2 (Chrome extension), this workflow auto-patches code review
+# findings using the Codex agent, then validates the fix with the project's
+# actual npm scripts (lint, typecheck, test) before pushing to the PR branch.
+#
+# Safety guardrails:
+#   - Max 3 remediation attempts per commit SHA (then requires human intervention)
+#   - SHA validation: only remediates findings that reference the CURRENT HEAD
+#   - Local validation (lint + typecheck + tests) runs BEFORE any git push
+#   - Never bypasses the risk-policy-gate or CI checks
+#
+# Required secrets:
+#   OPENAI_API_KEY — for the Codex remediation agent
+# Required variables:
+#   CODE_REVIEW_BOT — GitHub login of the review bot (e.g., 'coderabbitai[bot]')
+
+name: Auto-Remediation
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+env:
+  CODE_REVIEW_BOT: ${{ vars.CODE_REVIEW_BOT || 'coderabbitai[bot]' }}
+  REMEDIATION_AGENT: ${{ vars.REMEDIATION_AGENT || 'codex' }}
+  MAX_ATTEMPTS: "3"
+
+jobs:
+  remediate:
+    name: Auto-Remediate Code Review Findings
+    runs-on: ubuntu-latest
+
+    if: github.event.issue.pull_request != null
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Validate comment source and detect actionable findings
+      # -----------------------------------------------------------------------
+      - name: Validate comment source and extract findings
+        id: validate
+        uses: actions/github-script@v7
+        env:
+          CODE_REVIEW_BOT: ${{ env.CODE_REVIEW_BOT }}
+        with:
+          script: |
+            const fs = require('fs');
+            const comment  = context.payload.comment;
+            const expected = process.env.CODE_REVIEW_BOT;
+
+            if (comment.user.login !== expected) {
+              console.log(`Comment from @${comment.user.login} (not @${expected}). Skipping.`);
+              core.setOutput('should_remediate', 'false');
+              return;
+            }
+
+            const body = comment.body || '';
+
+            const cleanSignals = [
+              'no issues found',
+              'lgtm',
+              'looks good to me',
+              'no findings',
+              'all previous issues have been resolved',
+              'all issues have been resolved',
+            ];
+            const isClean = cleanSignals.some(s => body.toLowerCase().includes(s));
+
+            const actionableSignals = [
+              'actionable comment',
+              '**issue**',
+              '**error**',
+              '**warning**',
+              '**bug**',
+              '**vulnerability**',
+              '**security**',
+              'must be fixed',
+              'should be fixed',
+              'missing error handling',
+              'potential issue',
+            ];
+            const hasFindings = actionableSignals.some(s => body.toLowerCase().includes(s));
+
+            if (isClean && !hasFindings) {
+              console.log('Clean review detected — no remediation needed.');
+              core.setOutput('should_remediate', 'false');
+              return;
+            }
+
+            if (!hasFindings) {
+              console.log('Comment does not contain actionable findings signals. Skipping.');
+              core.setOutput('should_remediate', 'false');
+              return;
+            }
+
+            fs.writeFileSync('/tmp/findings.md', body, 'utf8');
+            console.log(`Actionable findings detected (${body.length} chars). Written to /tmp/findings.md`);
+
+            core.setOutput('should_remediate', 'true');
+            core.setOutput('comment_id', comment.id.toString());
+
+      # -----------------------------------------------------------------------
+      # Step 2: Get PR details — branch name and HEAD SHA
+      # -----------------------------------------------------------------------
+      - name: Get PR branch and HEAD SHA
+        id: pr
+        if: steps.validate.outputs.should_remediate == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            core.setOutput('head_sha',  pr.head.sha);
+            core.setOutput('branch',    pr.head.ref);
+            core.setOutput('pr_number', pr.number.toString());
+            console.log(`PR #${pr.number} branch: ${pr.head.ref} | HEAD: ${pr.head.sha.substring(0, 12)}`);
+
+      # -----------------------------------------------------------------------
+      # Step 3: Validate that the findings comment references the current HEAD SHA
+      # -----------------------------------------------------------------------
+      - name: Validate findings are for current HEAD SHA
+        id: sha-check
+        if: steps.validate.outputs.should_remediate == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const headSha   = '${{ steps.pr.outputs.head_sha }}';
+            const shortSha  = headSha.substring(0, 7);
+            const commentId = '${{ steps.validate.outputs.comment_id }}';
+
+            const body = fs.readFileSync('/tmp/findings.md', 'utf8');
+            const shaInComment = body.includes(headSha) || body.includes(shortSha);
+
+            if (!shaInComment) {
+              console.log(
+                `Comment (id: ${commentId}) does not reference current HEAD SHA ` +
+                `${shortSha}. Stale comment — skipping.`
+              );
+              core.setOutput('is_current', 'false');
+            } else {
+              console.log(`Comment references current HEAD SHA ${shortSha}. Proceeding.`);
+              core.setOutput('is_current', 'true');
+            }
+
+      # -----------------------------------------------------------------------
+      # Step 4: Check remediation attempt count (safety guardrail)
+      # -----------------------------------------------------------------------
+      - name: Check remediation attempt count (safety guardrail)
+        id: attempts
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true'
+        uses: actions/github-script@v7
+        env:
+          MAX_ATTEMPTS: ${{ env.MAX_ATTEMPTS }}
+        with:
+          script: |
+            const maxAttempts = parseInt(process.env.MAX_ATTEMPTS, 10);
+            const headSha     = '${{ steps.pr.outputs.head_sha }}';
+            const trackerKey  = '<!-- remediation-tracker';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+              per_page:     100,
+            });
+
+            const tracker = comments.find(c => c.body && c.body.includes(trackerKey));
+
+            let attempts  = 0;
+            let trackerId = '';
+
+            if (tracker) {
+              const match = tracker.body.match(/<!-- remediation-tracker ({.*?}) -->/);
+              if (match) {
+                try {
+                  const trackerData = JSON.parse(match[1]);
+                  if (trackerData.sha === headSha) {
+                    attempts = trackerData.attempts || 0;
+                  } else {
+                    console.log(`SHA changed. Resetting attempt counter.`);
+                  }
+                  trackerId = tracker.id.toString();
+                } catch (e) {
+                  console.log('Could not parse tracker JSON. Starting fresh.');
+                }
+              }
+            }
+
+            console.log(`Remediation attempts for SHA ${headSha.substring(0, 12)}: ${attempts}/${maxAttempts}`);
+
+            if (attempts >= maxAttempts) {
+              core.setFailed(
+                `🛑 Max remediation attempts (${maxAttempts}) reached for SHA ${headSha.substring(0, 12)}.\n` +
+                `This PR requires human intervention.`
+              );
+              return;
+            }
+
+            core.setOutput('attempt_number', (attempts + 1).toString());
+            core.setOutput('tracker_id',     trackerId);
+            core.setOutput('has_tracker',    tracker ? 'true' : 'false');
+
+      # -----------------------------------------------------------------------
+      # Step 5: Checkout the PR branch
+      # -----------------------------------------------------------------------
+      - name: Checkout PR branch
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        uses: actions/checkout@v4
+        with:
+          ref:   ${{ steps.pr.outputs.branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Step 6: Set up Node.js and install project dependencies
+      # -----------------------------------------------------------------------
+      - name: Set up Node.js
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install project dependencies
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        run: npm ci
+
+      # -----------------------------------------------------------------------
+      # Step 7: Run remediation agent (Codex)
+      #
+      # Agent: codex — set via REMEDIATION_AGENT repository variable
+      # Findings are written to /tmp/findings.md in Step 1.
+      # -----------------------------------------------------------------------
+      - name: Run remediation agent
+        id: remediate
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        env:
+          OPENAI_API_KEY:    ${{ secrets.OPENAI_API_KEY }}
+          REMEDIATION_AGENT: ${{ env.REMEDIATION_AGENT }}
+          ATTEMPT_NUMBER:    ${{ steps.attempts.outputs.attempt_number }}
+        run: |
+          echo "═══════════════════════════════════════════"
+          echo "  Auto-remediation attempt #${ATTEMPT_NUMBER}/${MAX_ATTEMPTS}"
+          echo "  Agent: ${REMEDIATION_AGENT}"
+          echo "  Branch: ${{ steps.pr.outputs.branch }}"
+          echo "  SHA: ${{ steps.pr.outputs.head_sha }}"
+          echo "  Repo: fluentify-v2 (Chrome extension)"
+          echo "═══════════════════════════════════════════"
+
+          echo ""
+          echo "── Findings being addressed ────────────────"
+          cat /tmp/findings.md
+          echo ""
+          echo "────────────────────────────────────────────"
+          echo ""
+
+          if [ "$REMEDIATION_AGENT" = "codex" ]; then
+            echo "Running Codex remediation..."
+            npx --yes openai/codex \
+              --approval-mode full-auto \
+              --task "Fix the following code review findings in this Chrome extension (fluentify-v2). Make minimal, targeted changes only. Do not refactor unrelated code. Be especially careful with src/background/, src/content/, and src/manifest.ts — these run with full browser permissions.
+
+$(cat /tmp/findings.md)"
+
+          elif [ "$REMEDIATION_AGENT" = "aider" ]; then
+            echo "Running Aider remediation..."
+            aider \
+              --yes-always \
+              --no-auto-commits \
+              --message "Fix the following code review findings in this Chrome extension. Make minimal, targeted changes only:
+
+$(cat /tmp/findings.md)"
+
+          elif [ "$REMEDIATION_AGENT" = "custom" ]; then
+            echo "Running custom remediation agent..."
+            ./scripts/custom-agent.sh --findings /tmp/findings.md
+
+          else
+            echo "ERROR: Unknown REMEDIATION_AGENT: ${REMEDIATION_AGENT}"
+            echo "Set the REMEDIATION_AGENT repository variable to: codex, aider, or custom"
+            exit 1
+          fi
+
+          echo ""
+          echo "Remediation agent completed."
+
+      # -----------------------------------------------------------------------
+      # Step 8: Run focused local validation BEFORE pushing
+      #
+      # Uses EXACTLY the npm scripts defined in fluentify-v2's package.json:
+      #   lint      → eslint src/
+      #   typecheck → tsc --noEmit
+      #   test      → vitest --run
+      #
+      # WHY validate before pushing: catches syntax errors, type errors, and
+      # broken tests introduced by the remediation agent before they hit the PR.
+      # -----------------------------------------------------------------------
+      - name: Run focused local validation
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        run: |
+          echo "Running post-remediation validation for fluentify-v2..."
+
+          # Lint — catches syntax errors and ESLint violations
+          echo "→ Running eslint..."
+          npm run lint
+
+          # Type check — catches TypeScript errors introduced by the agent
+          echo "→ Running typecheck..."
+          npm run typecheck
+
+          # Unit tests — Vitest with --run flag (non-watch mode)
+          echo "→ Running tests..."
+          npm test -- --run
+
+          echo "✓ All validation checks passed."
+
+      # -----------------------------------------------------------------------
+      # Step 9: Commit and push the fix
+      # -----------------------------------------------------------------------
+      - name: Commit and push fix
+        id: push-fix
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "No changes after remediation. Code may already be correct."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Files modified by remediation agent:"
+          git diff --staged --name-only
+
+          git commit -m "fix(remediation): auto-patch for review findings [attempt ${{ steps.attempts.outputs.attempt_number }}/${{ env.MAX_ATTEMPTS }}]
+
+          Applied automated fix based on code review findings from ${{ env.CODE_REVIEW_BOT }}.
+
+          Review was for SHA: ${{ steps.pr.outputs.head_sha }}
+          Remediation attempt: ${{ steps.attempts.outputs.attempt_number }} of ${{ env.MAX_ATTEMPTS }}
+
+          This commit was generated automatically. A fresh review cycle will be
+          triggered by the pull_request synchronize event.
+
+          Findings addressed:
+          $(head -20 /tmp/findings.md | sed 's/^/  /')"
+
+          git push origin "${{ steps.pr.outputs.branch }}"
+
+          echo "Fix pushed to branch ${{ steps.pr.outputs.branch }}"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Step 10: Update remediation tracker comment
+      # -----------------------------------------------------------------------
+      - name: Update remediation attempt tracker
+        if: |
+          steps.validate.outputs.should_remediate == 'true' &&
+          steps.sha-check.outputs.is_current == 'true' &&
+          steps.attempts.outputs.attempt_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const headSha       = '${{ steps.pr.outputs.head_sha }}';
+            const attemptNumber = parseInt('${{ steps.attempts.outputs.attempt_number }}', 10);
+            const hasTracker    = '${{ steps.attempts.outputs.has_tracker }}' === 'true';
+            const trackerId     = hasTracker ? parseInt('${{ steps.attempts.outputs.tracker_id }}', 10) : null;
+            const maxAttempts   = parseInt('${{ env.MAX_ATTEMPTS }}', 10);
+            const hasChanges    = '${{ steps.push-fix.outputs.has_changes }}' !== 'false';
+
+            const trackerData = JSON.stringify({ sha: headSha, attempts: attemptNumber });
+
+            const statusLine = hasChanges
+              ? `✅ Fix committed and pushed. A fresh review cycle is in progress.`
+              : `ℹ️ No code changes were made (agent found nothing to fix or code was already correct).`;
+
+            const body = [
+              `<!-- remediation-tracker ${trackerData} -->`,
+              '',
+              `### 🔧 Auto-Remediation Tracker`,
+              '',
+              `| Field | Value |`,
+              `|---|---|`,
+              `| Attempt | ${attemptNumber} of ${maxAttempts} |`,
+              `| SHA | \`${headSha.substring(0, 12)}...\` |`,
+              `| Agent | \`${{ env.REMEDIATION_AGENT }}\` |`,
+              `| Status | ${statusLine} |`,
+              '',
+              attemptNumber >= maxAttempts
+                ? `> ⛔ **Max attempts reached.** Auto-remediation is stopped. Manual intervention required.`
+                : `> Next attempt will run if the fresh review cycle posts new findings.`,
+            ].join('\n');
+
+            if (hasTracker && trackerId) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: trackerId,
+                body,
+              });
+              console.log(`Updated tracker comment (id: ${trackerId})`);
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+              console.log('Created new tracker comment');
+            }
